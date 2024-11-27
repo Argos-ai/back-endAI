@@ -7,6 +7,7 @@ import logging
 from datetime import datetime
 from typing import Dict, List, Optional
 from utils.vhdl_segmenter import VHDLSegmenter, CodeSegment
+import time
 
 class HDLAnalyzer:
     """Simple HDL code analyzer using OpenAI API and code segmentation."""
