@@ -4,107 +4,108 @@ from dotenv import load_dotenv
 from typing import List, Dict
 import json
 from datetime import datetime
-from utils.vhdl_segmenter import VHDLSegmenter 
+from utils.vhdl_segmenter import VHDLSegmenter
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+import torch
+from tqdm import tqdm
+
 class VHDLTester:
     def __init__(self, sample_size: int = 5):
-        """Initialize the tester with database connection and segmenter."""
+        # Initialize connections
         load_dotenv()
-        self.mongo = MongoClient(os.getenv('DB_URI')).hdl_database.hdl_codes  # Ensure DB_URI is in .env
+        self.mongo = MongoClient(os.getenv('DB_URI')).hdl_database.hdl_codes
         self.segmenter = VHDLSegmenter()
         self.sample_size = sample_size
 
-    def fetch_samples(self) -> List[Dict]:
-        """Fetch a sample of VHDL files from the entire database index."""
-        return list(self.mongo.aggregate([
+        # Load model and tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
+        self.segment_model = AutoModelForSequenceClassification.from_pretrained("hdl_models/segment_final")
+        
+        # Load feature mapping
+        with open("hdl_models/segment_final/feature_mapping.json") as f:
+            self.feature_mapping = json.load(f)
+        print(f"Loaded {len(self.feature_mapping)} features")
+
+    def predict_segment(self, text: str) -> str:
+        inputs = self.tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=512)
+        
+        with torch.no_grad():
+            outputs = self.segment_model(**inputs)
+            pred_idx = torch.argmax(outputs.logits, dim=1).item()
+        
+        # Convert prediction index to feature name
+        for feature, idx in self.feature_mapping.items():
+            if idx == pred_idx:
+                return feature
+        return f"Unknown-{pred_idx}"
+
+    def analyze_code(self, code: str) -> Dict:
+        # Segment and analyze code
+        segments = self.segmenter.segment_code(code)
+        results = []
+        
+        for seg in segments:
+            if not seg.content.strip():
+                continue
+                
+            prediction = self.predict_segment(seg.content)
+            results.append({
+                'type': seg.segment_type,
+                'lines': (seg.start_line, seg.end_line),
+                'prediction': prediction,
+                'content': seg.content[:100] + '...' if len(seg.content) > 100 else seg.content
+            })
+            
+        return results
+
+    def run_tests(self):
+        print(f"\nTesting model on {self.sample_size} samples...")
+        
+        # Get samples with analysis
+        samples = list(self.mongo.aggregate([
+            {"$match": {"analysis": {"$exists": True}}},
             {"$sample": {"size": self.sample_size}}
         ]))
-
-    def analyze_sample(self, sample: Dict, idx: int) -> Dict:
-        """Analyze a single VHDL file."""
-        code = sample.get('content', '')
-        if not code:
-            return {'error': f"No content in sample {idx}"}
         
-        try:
-            segments = self.segmenter.segment_code(code)
-            return {
-                'document_id': str(sample['_id']),
-                'segments_found': len(segments),
-                'segment_details': [
-                    {
-                        'type': seg.segment_type,
-                        'name': seg.name,
-                        'lines': (seg.start_line, seg.end_line),
-                        'content_preview': seg.content[:100] + '...' if len(seg.content) > 100 else seg.content
-                    }
-                    for seg in segments
-                ]
-            }
-        except Exception as e:
-            return {'error': f"Error analyzing sample {idx}: {str(e)}"}
-
-    def run_tests(self) -> None:
-        """Run tests and generate a detailed summary."""
-        samples = self.fetch_samples()
-        if not samples:
-            print("No samples found.")
-            return
-
         results = []
-        segment_types = {}
-        total_segments = 0
-
-        print(f"\nRunning VHDL segmentation tests on {len(samples)} samples...\n")
-        
-        for idx, sample in enumerate(samples, 1):
-            print(f"Processing sample {idx}...")
-            result = self.analyze_sample(sample, idx)
-            if 'error' in result:
-                print(f"Error: {result['error']}")
+        for sample in tqdm(samples, desc="Analyzing samples"):
+            code = sample.get('content', '')
+            if not code:
                 continue
-
-            # Aggregate results
-            total_segments += result['segments_found']
-            for detail in result['segment_details']:
-                segment_types[detail['type']] = segment_types.get(detail['type'], 0) + 1
-
-            results.append(result)
-
-            # Print details for current sample
-            print(f"Found {result['segments_found']} segments:")
-            for detail in result['segment_details']:
-                print(f"- {detail['type']}: {detail['name'] if detail['name'] else 'unnamed'} "
-                      f"(lines {detail['lines'][0]}-{detail['lines'][1]})")
-
-        # Generate summary
-        print("\n=== Test Summary ===")
-        print(f"Total files processed: {len(samples)}")
-        print(f"Total segments found: {total_segments}")
-        print(f"Average segments per file: {total_segments / len(samples):.1f}")
-
-        print("\nSegment type distribution:")
-        for seg_type, count in sorted(segment_types.items(), key=lambda x: x[1], reverse=True):
-            percentage = (count / total_segments) * 100 if total_segments > 0 else 0
-            print(f"- {seg_type}: {count} ({percentage:.1f}%)")
-
-        # Save results to file
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"vhdl_test_results_{timestamp}.json"
-        with open(filename, 'w') as f:
-            json.dump({
-                'timestamp': datetime.now().isoformat(),
-                'total_samples': len(samples),
-                'total_segments': total_segments,
-                'segment_types': segment_types,
-                'results': results
-            }, f, indent=2)
-
-        print(f"\nDetailed results saved to {filename}")
+                
+            # Get predictions
+            predictions = self.analyze_code(code)
+            
+            # Get actual features
+            actual = []
+            if 'analysis' in sample and 'key_features' in sample['analysis']:
+                actual = [f['key_feature'] for f in sample['analysis']['key_features']]
+            
+            # Store results
+            results.append({
+                'id': str(sample['_id']),
+                'predictions': [p['prediction'] for p in predictions],
+                'actual_features': actual,
+                'details': predictions
+            })
+            
+            # Print results for this sample
+            print(f"\nSample {sample['_id']}:")
+            print("Predictions:")
+            for p in predictions:
+                print(f"- {p['type']}: {p['prediction']}")
+            print("Actual features:", actual)
+        
+        # Save results
+        output_file = f"test_results_{datetime.now():%Y%m%d_%H%M%S}.json"
+        with open(output_file, 'w') as f:
+            json.dump(results, f, indent=2)
+            
+        print(f"\nResults saved to {output_file}")
 
 def main():
-    """Entry point for the tester."""
-    print("\n=== Starting VHDL Tester ===\n")
-    tester = VHDLTester(sample_size=50)  # Adjust sample size as needed
+    print("\n=== Starting HDL Model Testing ===")
+    tester = VHDLTester(sample_size=5)
     tester.run_tests()
     print("\n=== Testing Complete ===")
 
